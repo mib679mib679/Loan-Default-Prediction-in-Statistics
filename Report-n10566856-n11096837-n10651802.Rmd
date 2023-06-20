@@ -1,0 +1,795 @@
+# MXN600 Major Data Analysis Project
+
+---
+title: "Report"
+author: "Ricardo Morado Lopez, Bahareh Shahrestanaki, Li Jen Shao"
+output: html_document
+date: '2022-10-07'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(MASS)
+library(ggpubr)
+library(DHARMa)
+library(AER)
+library(ggplot2)
+library(reshape2)
+library(GGally)
+library(pROC)
+library(caret)
+library(lme4)
+library(caTools)
+library(stringr)
+```
+
+# 1- Analysis Motivation
+
+This scenario is based on data belonging to a regional Australian bank. There are concerns about the performance of the current credit risk models that the company has been using. For more details on this please refer to the ROC graphs for train and validation sets provided in the scenario specification. For the former the Gini score is 0.114 and for the latter 0.110. This is a signal of bad performance as these scores are very far from 1.
+
+The management at the bank has given the task of creating new credit risk models with the objective of predicting loan default based on information known at the time of loan application. In order to do so historical lending data that had been used to benchmark the old model has been provided split into training and validation set. Moreover an extended version of the data has been provided as well and includes additional variables with information about when and where the loan was issued.
+
+Management has a number of specific concerns that need to be addressed using the historical lending data:
+
+1- How does your new model perform compared to the one you used previously? How can it be expected to perform on new loan applications? For this, you must use the training and validation data used in the previous benchmark
+
+2- What are the important variables in this model and how do they compare to variables that are traditionally important for predicting credit risk in the banking sector? One regulatory requirement for lenders is that they need to clearly explain how a loan application was assessed. To demonstrate to management that this can be achieved, clearly interpret all covariates in your model in terms of their effect on predicting credit risk.
+
+Furthermore, management also has queries about the extended data containing location and time variables:
+
+3- Can accounting for this variation (e.g., state/zip-code and time) improve performance benchmarks?
+
+4- Are there any surprising differences in variables that are important for predicting credit risk? This is again essential for regulations.
+
+5- Does credit risk change over time or between states? This is not something the bank has previously investigated and results may inform modified loan policies in the future.
+
+# 2- Binomial Model
+
+## 2.1 Data Cleaning, Pre-processing and Exploratory Analysis
+
+We first load the data and conduct the necessary data pre-processing steps in order to be able to perform meaningful analysis using both data-sets:
+
+```{r}
+# train_shape = (23052, 21)
+# test_shape = (7683, 21)
+train = read.csv("benchmark_training_loan_data.csv") #we load both training and validation data
+test = read.csv("benchmark_validation_loan_data.csv")
+train <- subset(train, select = -X) # we drop the row number column
+test <- subset(test, select = -X)
+head(train)
+head(test)
+```
+
+We perform sanity checks to search for missing values or other elements affecting data quality
+
+```{r}
+# sanity check
+sum(is.null(train))# we check for missing values
+sum(is.null(test))
+unique(train$term)# we check the values of term
+unique(test$term)
+unique(train$emp_length)#we check the values of emp lenght
+unique(train$home_ownership)#we check the values of home ownership
+```
+
+We can observe that there are no missing values but emp_length has "n/a" values and is not an integer as described in the data dictionary. Furthermore, home_ownership has a "NONE" category that is not listed in the data dictionary.
+
+We proceed to fix the data quality issues detected:
+
+```{r}
+# preprocess for emp_length column
+train = filter(train, emp_length != "n/a") #we remove n/a values
+test = filter(test, emp_length != "n/a")
+
+train$emp_length = gsub("years","",as.character(train$emp_length))#we remove the word years
+train$emp_length[train$emp_length == "10+ "] = 10
+train$emp_length[train$emp_length == "< 1 year"] = 0 #fixed changed here
+train$emp_length[train$emp_length == "1 year"] = 1
+
+test$emp_length = gsub("years","",as.character(test$emp_length))#we remove the word years
+test$emp_length[test$emp_length == "10+ "] = 10
+test$emp_length[test$emp_length == "< 1 year"] = 0 #fixed changed here
+test$emp_length[test$emp_length == "1 year"] = 1
+
+# preprocess for home_ownership column
+
+train = filter(train, home_ownership != "NONE") #we remove "NONE" values
+test = filter(test, home_ownership != "NONE")
+```
+
+We convert variables to their appropriate data types:
+
+```{r}
+# convert datatype to categorical data for the variable that require it 
+train$term = factor(train$term)
+test$term = factor(test$term)
+
+train$emp_length = as.integer(train$emp_length) 
+test$emp_length = as.integer(test$emp_length)
+
+train$home_ownership = factor(train$home_ownership)
+test$home_ownership = factor(test$home_ownership)
+
+train$verification_status = factor(train$verification_status)
+test$verification_status = factor(test$verification_status)
+
+train$purpose = factor(train$purpose)
+test$purpose = factor(test$purpose)
+
+train$repay_fail = factor(train$repay_fail)
+test$repay_fail = factor(test$repay_fail)
+
+
+
+is.factor(train$term) #we check for successful conversion
+is.integer(train$emp_length)
+is.factor(train$home_ownership)
+is.factor(train$verification_status)
+is.factor(train$purpose)
+is.factor(train$repay_fail)
+```
+
+```{r}
+#we summarise the data
+#sapply(train, summary)
+```
+
+We plot a correlation graph with all the the numerical variables:
+
+```{r}
+# correlation matrix without categorical value
+library(corrplot)
+train_cor = train[ , c(1, 3, 4, 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21)]
+corrplot(cor(train_cor))
+```
+
+We observe that the variable total_rec_int is highly correlated with int_rate and total_rec_prncp. Hence we decided to delete it to avoid the high number of correlations. Furthermore, we observe that open_acc is highly correlated with total_acc. Upon analysis, open_acc represents the number of credit lines opened in the borrowers credit file while total_acc only represents the ones currently open. Hence for further precision we decide to keep total_acc. Finally, total_rec_prncp is highly correlated with loan amnt. The former is the principal received to date and the latter represents the listed amount of the loan applied for by the borrower. We judge loan amount to be more a important variable for a loan application process and therefore decide to remove total_rec_prncp.
+
+We drop the variables with high correlations to avoid co-linearity issues:
+
+```{r}
+#we drop the variables with high correlations
+train <- subset(train, select = -total_rec_int)
+test <- subset(test, select = -total_rec_int)
+
+train <- subset(train, select = -total_rec_prncp)
+test <- subset(test, select = -total_rec_prncp)
+
+train <- subset(train, select = -open_acc)
+test <- subset(test, select = -open_acc)
+```
+
+We perform exploratory analysis:
+
+```{r}
+# exploratory
+total = rbind(train, test)
+
+label_balance = plot(x = total$repay_fail, main = "The class are imbalanced", xlab = "repay_fail", ylab = "count")
+
+tmp <- melt(total[, c("repay_fail", "loan_amnt", "int_rate", "emp_length", "annual_inc", "dti", "delinq_2yrs")], id.vars="repay_fail")
+
+tmp1 <- melt(total[, c("repay_fail", "inq_last_6mths", "pub_rec", "revol_bal", "revol_util", "total_acc", "last_pymnt_amnt", "credit_age_yrs")], id.vars="repay_fail")
+
+boxpot = ggplot(tmp, aes(repay_fail, y = value, fill=factor(repay_fail))) +
+  geom_boxplot() + facet_wrap(~variable, scales="free_y") + labs(title = "repay_fail VS. continuous variables part-1")
+
+boxpot1 = ggplot(tmp1, aes(repay_fail, y = value, fill=factor(repay_fail))) + geom_boxplot() + facet_wrap(~variable, scales="free_y") + labs(title = "repay_fail VS. continuous variables part-2")
+
+# exploratory for the old categorical variables
+gg = ggplot(data = total, aes(x = term, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each terms"))
+
+gg1 = ggplot(data = total, aes(x = home_ownership, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each home_ownership"))
+
+gg2 = ggplot(data = total, aes(x = verification_status, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each verification_status"))
+
+gg3 = ggplot(data = total, aes(x = purpose, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each purpose")) + theme(axis.text.x = element_text(size = 8, angle=90))
+
+gg_plot = ggarrange(gg, gg1, ncol = 1, nrow = 2)
+gg_plot1 = ggarrange(gg2, gg3, ncol = 1, nrow = 2)
+
+label_balance
+boxpot
+boxpot1
+gg_plot
+gg_plot1
+```
+
+Firstly, from the above we found that the classes in our response variable are imbalanced. We also used boxplots to explore the relationship between continuous variables and the dependent variable. As a result, we do see some variables with different distributions depending on the repay_fail value such as interest rate or last payment amount. We also notice the presence of some outliers. For the categorical variables we use histograms to show the relationship between them and the response. Once more we see that some variables are distributed really differently for each value of our response variable. However, to confirm the existence of any relation between these variables and repay_fail we need to perform some deeper analysis using statistical models.
+
+## 2.2 Model Selection
+
+### Fit Models
+
+To begin with we are going to assess the suitability of a binomial GLM using logit, probit and cloglog link functions. In order to find the best set of variables and link function we perform both backward and forward selection using the full model for each. The optimal parameters are chosen by selecting the variable combination with the lowest AIC value among all the possibilities.
+
+We first fit the three models and perform forward and backward selection:
+
+```{r}
+# Fit the full model 
+B_full_model_logit <- glm(repay_fail ~., data = train, family=binomial(link="logit"))
+B_full_model_probit <- glm(repay_fail ~., data = train, family=binomial(link="probit"))
+B_full_model_cloglog <- glm(repay_fail ~., data = train, family=binomial(link="cloglog"))
+
+# Stepwise regression model
+B_full_model_logit <- stepAIC(B_full_model_logit, direction = "both", 
+                      trace = 0)
+B_full_model_probit <- stepAIC(B_full_model_probit, direction = "both", 
+                      trace = 0)
+B_full_model_cloglog <- stepAIC(B_full_model_cloglog, direction = "both", 
+                      trace = 0)
+```
+
+We print the attributes selected for each model:
+
+```{r}
+#Inspect models:
+print("Logit")
+formula(B_full_model_logit)
+print("Probit")
+formula(B_full_model_probit)
+print("Cloglog")
+formula(B_full_model_cloglog)
+```
+
+We observe that all three models are identical in terms of the variables being selected. To decide on which one is the better fit we first need to compare them based on information criteria.
+
+### Compare Model Options
+
+We compare the AIC, BIC, and log-Likelihood of the three models models. First we calculate the values for each model.
+
+```{r}
+#Create a list containing fitted model objects:
+model.list <- list(
+  "M1" = B_full_model_logit,
+  "M2" = B_full_model_probit,
+  "M3" = B_full_model_cloglog
+)
+
+#Calculate three measures of fit: 
+#(See ?lapply and ?sapply for how to apply functions over a list.)
+logLiks <- sapply(model.list,FUN = logLik)
+aics <- sapply(model.list,FUN = AIC)
+bics <- sapply(model.list,FUN = BIC)
+```
+
+Then we create a table displaying the values of AIC, BIC and log-likelihood for each model.
+
+```{r}
+#Aggregate measures of fit into a single data-frame for plotting
+plot_data <- 
+  data.frame(
+    model = c("M1","M2", "M3"),
+    aic = aics,
+    bic = bics,
+    logL = logLiks
+  )
+
+#Display table with measures:
+knitr::kable(plot_data,row.names = FALSE,
+             col.names = c("Model","AIC","BIC","log-Likelihood"))
+
+# Notes: Lower AIC/BIC the better.
+#   Log-likelihood *increases with number of parameters* (unadjusted)
+```
+
+For alternative visualization we also plot these values into a graph:
+
+```{r}
+#Melt the data into long form for ggplot:
+long_plot_data <- melt(data = plot_data,id = "model",variable.name = "measure")
+
+#Plot together for comparison
+ggplot(
+  data = long_plot_data,
+  mapping = aes(
+    x = model,
+    y = value,
+    group = measure,
+    colour = measure)) + geom_point()+ scale_colour_discrete(
+    breaks = c("aic","bic","logL"), labels = c("AIC","BIC","log-Lik.")) +
+  labs(x = "Model",y = "Value", colour = "Measure")
+```
+
+M1 corresponds to the logit model, M2 to the probit and M3 to the cloglog. We can observe that M1 has the lowest AIC and BIC. Therefore the information criteria metrics support that M1 is the best fitting model. Furthermore because the three models have the exact same variables selected they are comparable in terms of log-Likelihood. regarding such metric M1 also has the largest log-Likelihood. Hence, the M1 model using the logit function is the best fitting model.
+
+We fit the full model for the purposes of a final comparison with M1:
+
+```{r}
+B_full_model <- glm(repay_fail ~., data = train, family=binomial(link="logit"))
+```
+
+Since M1 is nested inside of the full model these two models can be compared using a $\chi^2$-test,, with hypotheses:
+
+\- H0: Additional parameters are needed to explain variation
+
+\- H1: Additional parameters are not needed to explain variation
+
+```{r}
+anova(B_full_model_logit,B_full_model,test="Chisq")
+```
+
+Since the p-value is not significant M1 explains variation better than the full model.
+
+We print the formula of the selected model:
+
+```{r}
+#Inspect models:
+formula(B_full_model_logit)
+```
+
+### Goodness of fit
+
+Now we can analyse the residual plots to determine goodness-of-Fit:
+
+```{r}
+# residual plots
+pchisq(B_full_model_logit$deviance, df=B_full_model_logit$df.residual, lower.tail=FALSE)
+res=simulateResiduals(B_full_model_logit)
+plot(res)
+```
+
+The QQ plot shows no major departures from uniformity in the distribution of residuals. This shows evidence that the assumptions of the model are met. The Residual vs. Predicted plot detects the presence of outliers and showcases that the trend is very flat and the fit is good.
+
+We now proceed to assess if there is overdispersion:
+
+The dispersion $\phi$ can be estimated using the deviance $\hat{D}$ and $N-k$, where $N$ is the sample size, and $k$ is the number of parameters. If
+
+$$
+\hat{\phi} > 1 + 3 \sqrt{\frac{2}{N-k}},
+$$
+
+then this is a sign of overdispersion.
+
+We perform the test:
+
+```{r}
+Nmp <- B_full_model_logit$df.residual   # N - p
+phi_hat <- deviance(B_full_model_logit)/Nmp
+phi_hat > 1 + 3*sqrt(2/Nmp)
+```
+
+There is no indication of overdispersion when fitting the Binomial GLM.
+
+Hence, given the analysis of the residual plots and the lack of overdispersion we can conclude that binomial model is an appropriate fit for this data.
+
+### Comparison with benchmark
+
+We plot the ROC curves:
+
+```{r}
+#ROC-curve using pROC library
+predicted_test <- predict(B_full_model_logit, test, type="response")
+AUC_test = auc(test$repay_fail, predicted_test)
+roc_test = roc(test$repay_fail ~ predicted_test)
+Gini_test = (AUC_test*2)-1
+
+
+predicted_train <- predict(B_full_model_logit, train, type="response")
+AUC_train = auc(train$repay_fail, predicted_train)
+roc_train = roc(train$repay_fail ~ predicted_train)
+Gini_train = (AUC_train*2)-1
+
+par(mfrow=c(1,2))
+
+roc_plot_train = plot(roc_train, main= paste("Training set ROC, Gini = ", round(Gini_train, 3)), legacy.axes = TRUE, xlab="False Positive Rate", ylab= "True Positive Rate")
+roc_plot_test = plot(roc_test, main= paste("Testing set ROC, Gini = ", round(Gini_test, 3)), legacy.axes = TRUE, xlab="False Positive Rate", ylab= "True Positive Rate")
+```
+
+The curve is leaning towards the upper side of the graph for both training and validation data and both Gini scores are a lot closer to 1 compared with the benchmark (see assessment specification) indicating good model performance. Therefore we can conclude that the new model improves performance significantly.
+
+We perform 10 fold cross-validation:
+
+```{r}
+set.seed(125)
+
+test_control <- trainControl(method = "cv",
+                              number = 10)
+# training the model by assigning sales column
+# as target variable and rest other column
+# as independent variable
+model <- train(repay_fail ~loan_amnt + term + int_rate + emp_length + annual_inc + 
+    verification_status + purpose + inq_last_6mths + pub_rec + 
+    revol_bal + last_pymnt_amnt + 
+    credit_age_yrs, data = test,
+               method = "glm",
+               family = binomial(link="logit"),
+               trControl = test_control)
+print(model)
+```
+
+Cross-validation results show that the performance on the test data is excellent with an accuracy of 86.09551%. Consequently we can expect the model to perform well on unseen data.
+
+## 2.3 Analysis
+
+We now proceed to analyse the regression outputs:
+
+```{r}
+summary(B_full_model_logit)
+```
+
+First of all, it is relevant to note that the dependent variable repay_fail is a factor with possible values 0 and 1. The value 1 indicates failure to repay and 0 indicates that the due payment was performed as expected. Hence, positive coefficients in predictors will indicate that they are related to repayment failure. Furthermore, the predictors term and purpose are also factors. Consequently the will have one coefficient for each level of the factor variable providing information about the variation in the dependent variable for each level compared to a reference category. For term the reference category is "36 months" representing the number of payments on the loan. For purpose the reference category is "car" representing the purpose for which the loan is being requested.
+
+For this analysis in order to consider a coefficient significant we want to be very certain about it having tangible effects on repay_fail. As a result we choose a significance level of 0.001. According to such criteria the significant variables are: loan_amnt, term60 months, int_rate, annual_inc, purposesmall_business, inq_last_6mths, pub_rec, revol_bal, last_pymnt_amnt and credit_age_yrs.
+
+We calculate the 95% confidence interval for each coefficient:
+
+```{r}
+confint(B_full_model_logit, level = 0.95)
+```
+
+We generate a data-frame containing the variable names, coefficient values and their confidence intervals
+
+```{r}
+variable_name <- c("loan_amnt", "term60 months", "int_rate", "annual_inc", "purposesmall_business", "inq_last_6mths", "pub_rec", "revol_bal", "last_pymnt_amnt", "credit_age_yrs")
+coefficient <- c("5.477e-05", "6.428e-01", "1.202e-01", "-5.538e-06", "8.142e-01", "1.397e-01", "2.917e-01", "3.982e-06", "-1.600e-03", "-1.249e-02")
+
+LL <- c("4.724145e-05", "5.359333e-01", "1.046630e-01", "-6.917651e-06", "5.327975e-01", "1.144281e-01", "1.360648e-01", "1.742405e-06", "-1.730576e-03", "-1.990577e-02")
+UL <- c("6.233754e-05", "7.494831e-01", "1.357750e-01", "-4.202529e-06", "1.101405e+00", "1.651570e-01", "4.450083e-01", "6.185996e-06", "-1.475602e-03", "-5.149986e-03")
+
+
+
+plot <- data.frame(variable_name, coefficient, LL, UL)
+
+plot$coefficient <- as.numeric(plot$coefficient)
+plot$LL <- as.numeric(plot$LL)
+plot$UL <- as.numeric(plot$UL)
+```
+
+We generate a visualization illustrating the coefficients of each variable in terms of their effect on repay_fail and their corresponding confidence interval:
+
+```{r}
+p= ggplot(plot, aes(x=coefficient, y=variable_name)) + 
+  geom_point()+
+  geom_errorbar(aes(xmin = LL, xmax = UL))+
+  scale_y_discrete(limits = rev(c("loan_amnt", "term60 months", "int_rate", "annual_inc", "purposesmall_business", "inq_last_6mths", "pub_rec", "revol_bal", "last_pymnt_amnt", "credit_age_yrs")))+
+  ggtitle("Binomial Regression Results for significant coefficients")+
+  ylab("Variable")+
+  xlab("Coefficient")+
+  geom_vline(xintercept=0,lwd=0.5,colour="black")
+
+p
+```
+
+We now proceed to analyse the effect of each significant predictor on the dependent variable.
+
+With a positive effect we have:
+
+1.  loan_amnt and revol_bal: Although these variables have a positive coefficient it is very close to zero and has a very small confidence interval. Hence, we do not expect the loan amount and the total credit revolving balance to have a major effect on the ability of customers to repay their loans.
+2.  term_60 months: This variable has a large positive coefficient and a medium sized confidence interval compared to other predictors. However, even at the upper and lower bounds of the confidence interval the value of the coefficient remains quite large compared to other variables. Hence we expect that, compared to clients that pay in 36 months, those that pay in 60 will have a higher likelihood of failing to repay their loans.
+3.  int_rate: This variable has a positive coefficient with a small confidence interval. It is far from 0 enough to conclude that higher interest rates will increase the likelihood of repayment failure.
+4.  purposesmall_business: This variable has the largest positive coefficient but also a very large confidence interval. However, even at the lower bound of the confidence interval the coefficient value remains high. As a result, we can expect that when the purpose of the loan is to invest on a small business the likelihood of repayment failure by clients will increase compared to when the purpose of the loan is for a car.
+5.  inq_last_6mths: This variable has a positive coefficient with a small confidence interval. It is far from 0 enough to conclude that an increase in the number of inquiries in the past 6 months will increase the likelihood that clients will fail to repay their loans.
+6.  pub_rec: This variable has a positive coefficient with a medium sized confidence interval. However, at any point of such confidence interval the coefficient remains with quite a high value. Consequently, we expect that the higher the number of public derogatory records is, the higher the probability for loan applicants to default is.
+
+With a negative effect we have:
+
+1.  annual_inc and last_pymnt_amnt: Although these variables have a negative coefficient it is very close to zero and has a very small confidence interval. Hence, we do not expect annual_income and the amount of the last payment made by clients to have a major effect on their ability to repay their loans.
+2.  credit_age_yrs: This variable has a negative coefficient close to zero but slightly more negative than the two others. However, the confidence interval is also slightly larger. Nevertheless, overall we do not expect the number of years since the borrower's earliest reported credit line to have a major effect on their ability to repay their loans.
+
+## 2.4 Conclusions
+
+At this stage of the analysis we can address the two first key data analysis questions brought forward by the client:
+
+1- According to the insights obtained through the ROC curve, the Gini score and cross-validation we can confirm that the new model performs significantly better than the previous one and that it can be expected to provide reliable results when confronted to new loan applications. Indeed, by comparison with the previous benchmark the true positive rate is a lot higher for both training and testing data with a Gini score a lot closer to 1. Moreover, the Gini score barely drops for the testing set compared to the training set and cross-validation on the test data provides an accuracy of 86%. Hence, the bank can trust on the performance of this model as a reliable source of benefits.
+
+2- The important variables of this model in terms of statistical significance of their coefficients are: loan_amnt, term60 months, int_rate, annual_inc, purposesmall_business, inq_last_6mths, pub_rec, revol_bal, last_pymnt_amnt and credit_age_yrs. Our research showcases that the traditionally important variables for predicting credit risk in the banking sector are related to the borrowers ability to service debt. More specifically, these are the purpose of the credit, the total debt and the borrower's financial strength. In that regard, the variable purposesmall_business in our model is the predictor with the most influence which aligns with the traditionally important variables. Moreover, pub_rec is also a highly influential predictor relating to the borrower's financial strength which is also in alignment with the variables previously mentioned. Nevertheless, loan_amnt and annual_inc have very limited explanatory power in our model which is surprising as they reflect total debt and financial strength respectively. Therefore, our model also has some differences in terms of important variables when compared to the ones traditionally considered. A good example of this is the fact that according to the model, the number of payments in which the loan is payed back is significantly more important than loan amounts or annual income as a predictor. For more specific interpretations of the effects of individual covariates on predicting credit risk please refer to the analysis section.
+
+# 3- Generalized Linear Mixed Effects Model
+
+## 3.1 Data Cleaning, Pre-processing and Exploratory Analysis
+
+We load the extended data-set and drop the correlated variables as per the correlation matrix that we plotted in the first section:
+
+```{r}
+extended = read.csv("extendend_version_loan_data.csv") #we load both training and validation data
+extended <- subset(extended, select = -c(X) )#drop unnecessary column containing row numbers
+head(extended)
+
+##we drop the correlated variables variables from the extended dataset
+extended <- subset(extended, select = -total_rec_int)
+extended <- subset(extended, select = -open_acc)
+extended <- subset(extended, select = -total_rec_prncp)
+
+```
+
+The new data-set has 4 new variables in addition to the previous ones which are issue_d, earliest_cr_line, zip_code and addr_state. They provide information about the date of issue of the loan, the date of issue of the first credit line of the borrower and the zip code and the state provided by the borrower. In this part of the analysis the objective is to use these new variables to account for trends that may exist over time or between different jurisdictions using a Generalized Linear Mixed Effects Model (GLMM).
+
+We then proceed to conduct sanity checks to search for missing values or data quality issues in the new variables. The code is commented out due to the length of the output.
+
+```{r}
+# sanity check
+sum(is.null(extended))# we check for missing values
+#unique(extended$issue_d)
+#unique(extended$zip_code)
+#unique(extended$addr_state)
+#unique(extended$earliest_cr_line)
+
+```
+
+We observe that there are no missing values in the data-set and we do not detect any abnormal observations in the new variables. Both date variables contain information about month and year.
+
+Therefore we proceed to perform the same data preprocessing as for the previous two data-sets. There is only one difference: As month can be nested within year we split issue_d and earliest_cr_line into two variables each. One capturing the month of occurrence and the other the year of occurrence.
+
+```{r}
+# preprocess for emp_length column
+extended = filter(extended, emp_length != "n/a") #we remove n/a values
+
+extended$emp_length = gsub("years","",as.character(extended$emp_length))#we remove the word years
+extended$emp_length[extended$emp_length == "10+ "] = 10
+extended$emp_length[extended$emp_length == "< 1 year"] = 0 #fixed changed here
+extended$emp_length[extended$emp_length == "1 year"] = 1
+
+# preprocess for home_ownership column
+
+extended = filter(extended, home_ownership != "NONE") #we remove "NONE" values
+
+#preprocess for isssue_d
+
+extended[c('issue_Month', 'issue_Year')] = str_split_fixed(extended$issue_d, '-', 2)
+extended[c('earliestCreLine_Month', 'earliestCreLine_Year')] = str_split_fixed(extended$earliest_cr_line, '-', 2)
+extended = subset(extended, select = -issue_d)
+extended = subset(extended, select = -earliest_cr_line)
+```
+
+We convert the variables to their appropriate type as we did before. For the new variables each of them is converted into a factor:
+
+```{r}
+# convert datatype to categorical data for the variable that require it 
+extended$term = factor(extended$term)
+extended$emp_length = as.integer(extended$emp_length) 
+extended$home_ownership = factor(extended$home_ownership)
+extended$verification_status = factor(extended$verification_status)
+extended$purpose = factor(extended$purpose)
+extended$repay_fail = factor(extended$repay_fail)
+extended$zip_code = factor(extended$zip_code)
+extended$addr_state = factor(extended$addr_state)
+extended$issue_Month = factor(extended$issue_Month)
+extended$issue_Year = factor(extended$issue_Year)
+extended$earliestCreLine_Month = factor(extended$earliestCreLine_Month)
+extended$earliestCreLine_Year = factor(extended$earliestCreLine_Year)
+
+
+is.factor(extended$term) #we check for successful conversion
+is.integer(extended$emp_length)
+is.factor(extended$home_ownership)
+is.factor(extended$verification_status)
+is.factor(extended$purpose)
+is.factor(extended$repay_fail)
+is.factor(extended$zip_code)
+is.factor(extended$addr_state)
+is.factor(extended$issue_Month)
+is.factor(extended$issue_Year)
+is.factor(extended$earliestCreLine_Month)
+is.factor(extended$earliestCreLine_Year)
+```
+
+We perform some exploratory analysis for the new variables:
+
+```{r}
+# exploratory for the new variables
+extended$issue_Month <- factor(extended$issue_Month, levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))
+
+extended$earliestCreLine_Month <- factor(extended$earliestCreLine_Month, levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))
+
+# We do see the difference in a month of view
+gg4 = ggplot(data = extended, aes(x = issue_Month, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each issue_month"))
+
+gg5 = ggplot(data = extended, aes(x = issue_Year, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each issue_year"))
+
+gg6 = ggplot(data = extended, aes(x = earliestCreLine_Month, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each earliestCreLine_month"))
+
+gg7 = ggplot(data = extended, aes(x = earliestCreLine_Year, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each earliestCreLine_year")) + theme(axis.text.x = element_text(size = 7, angle=90))
+
+gg8 = ggplot(data = extended, aes(x = addr_state, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each addr_state")) + theme(axis.text.x = element_text(size = 7, angle=90))
+
+gg9 = ggplot(data = extended, aes(x = zip_code, y = ..count.., fill = repay_fail)) + geom_bar() + theme_bw() + labs(title = ("Count of repay_fail in each zip_code")) + theme(axis.text.x = element_text(size = 2, angle=90, vjust = 1, hjust=1))
+
+
+plot_month = ggarrange(gg4, gg6, ncol = 1, nrow = 2)
+plot_year = ggarrange(gg5, gg7, ncol = 1, nrow = 2)
+
+plot_month
+plot_year
+gg8
+gg9
+
+```
+
+Above is the exploratory analysis for the new variables. From a month point of view we do not see a significant difference between issue_month and earliestCreLine_Month regarding their relationship with the dependent variable. There are also no particular months seeming to have a considerably higher or lower likelihood of default. From a year point of view we do see some differences across different years in absolute numbers in the count of defaults. However, these do not seem considerably different in proportion to the total count of the values of the dependent variable. It is also hard to tell if the proportion of defaults per different values in addr_state or zip_code varies significantly. Particularly zip_code has a very high number of unique values leading to a very detailed graph. To better assess the existence of any relation between these new variables and repay_fail we need to perform some deeper analysis using a statistical model.
+
+The new variables will be used as mixed effects in the model. But before using them we nest zip code within state for our location variables and month within year for our time related variables. We therefore generate three variables to be used as mixed effects: location_nest, issue_date_nest and earliestCreLine_nest.
+
+```{r}
+extended <- within(extended, issue_date_nest <- factor(as.factor(issue_Year):issue_Month))
+extended <- within(extended, earliestCreLine_nest <- factor(as.factor(earliestCreLine_Year):earliestCreLine_Month))
+extended <- within(extended, location_nest <- factor(as.factor(addr_state):zip_code))
+extended = subset(extended, select = -earliestCreLine_Year)
+extended = subset(extended, select = -earliestCreLine_Month)
+extended = subset(extended, select = -issue_Year)
+extended = subset(extended, select = -issue_Month)
+extended = subset(extended, select = -addr_state)
+extended = subset(extended, select = -zip_code)
+```
+
+Before training the model we split the data into training and testing set. As per usual, we assign a higher proportion of data quantity to the training set:
+
+```{r}
+
+set.seed(42) 
+sample = sample.split(extended$repay_fail, SplitRatio = 0.7)
+extended_train = subset(extended, sample == TRUE)
+extended_test  = subset(extended, sample == FALSE)
+```
+
+## 3.2 New Model Fit
+
+We fit the generalized linear mixed effects model. For such purpose we use the same variables previously selected for the binomial model. The key difference is that we now add our mixed effects using the new nested variables we created from the new variables included in the extended data:
+
+```{r}
+#Fit the model
+
+GLMM_full_model_logit =  glmer(repay_fail ~ loan_amnt + term + int_rate + emp_length + annual_inc + purpose + inq_last_6mths + pub_rec + revol_bal + revol_util + total_acc + last_pymnt_amnt + credit_age_yrs + (1|issue_date_nest) + (1|location_nest) + (1|earliestCreLine_nest), data = extended_train, family=binomial(link = "logit"), nAGQ=0L)
+
+
+
+```
+
+### Goodness of fit
+
+Now we can analyse the residual plots to determine goodness-of-Fit:
+
+```{r}
+res = simulateResiduals(GLMM_full_model_logit)
+plot(res)
+```
+
+The QQ plot shows no major departures from uniformity in the distribution of residuals. This shows evidence that the assumptions of the model are met. The Residual vs. Predicted plot detects the presence of outliers and showcases that the trend is very flat and the fit is good.
+
+### Comparison with benchmarks
+
+We plot the ROC curves:
+
+```{r}
+# ROC for train
+prob_train = predict(GLMM_full_model_logit, extended_train, type=c("response"), allow.new.levels = TRUE)
+g_train = roc(extended_train$repay_fail ~ prob_train)
+AUC_train = auc(extended_train$repay_fail, prob_train)
+Gini_train = (AUC_train*2)-1
+
+# ROC for test
+# the length of the variable is different
+prob_test = predict(GLMM_full_model_logit, extended_test, type=c("response"), allow.new.levels = TRUE)
+g_test = roc(extended_test$repay_fail ~ prob_test)
+AUC_test = auc(extended_test$repay_fail, prob_test)
+Gini_test = (AUC_test*2)-1
+
+par(mfrow=c(1,2))
+
+roc_plot_train = plot(g_train, main= paste("Training set ROC, Gini = ", round(Gini_train, 3)), legacy.axes = TRUE, xlab="False Positive Rate", ylab= "True Positive Rate")
+
+roc_plot_test = plot(g_test, main= paste("Testing set ROC, Gini = ", round(Gini_test, 3)), legacy.axes = TRUE, xlab="False Positive Rate", ylab= "True Positive Rate")
+```
+
+For this new model as well, the curve is leaning towards the upper side of the graph for both training and validation data and both Gini scores are a lot closer to 1 compared with the benchmark (see assessment specification) indicating good model performance. Moreover the Gini score is slightly higher for this model than for the binomial model for both training and testing sets. Therefore we can conclude that the new model improves performance significantly compared to the benchmark but also slightly compared to the binomial model.
+
+## 3.3 Analysis
+
+We now proceed to analyse the regression outputs:
+
+```{r}
+summary(GLMM_full_model_logit)
+```
+
+First of all, it is relevant to note that the dependent variable repay_fail is a factor with possible values 0 and 1. The value 1 indicates failure to repay and 0 indicates that the due payment was performed as expected. Hence, positive coefficients in predictors will indicate that they are related to repayment failure. Furthermore, the predictors term and purpose are also factors. Consequently the will have one coefficient for each level of the factor variable providing information about the variation in the dependent variable for each level compared to a reference category. For term the reference category is "36 months" representing the number of payments on the loan. For purpose the reference category is "car" representing the purpose for which the loan is being requested.
+
+For this analysis in order to consider a coefficient significant we want to be very certain about it having tangible effects on repay_fail. As a result we choose a significance level of 0.001. According to such criteria the significant variables are: loan_amnt, term60 months, int_rate, annual_inc, purposesmall_business, inq_last_6mths, pub_rec, revol_bal, revol util, last_pymnt_amnt and credit_age_yrs. The only difference with the binomial model is that revol_util is now significant.
+
+We calculate the 95% confidence interval for each coefficient:
+
+```{r}
+confint(GLMM_full_model_logit, level = 0.95, method = "Wald")
+```
+
+We generate a data-frame containing the variable names, coefficient values and their confidence intervals
+
+```{r}
+variable_name <- c("loan_amnt", "term60 months", "int_rate", "annual_inc", "purposesmall_business", "inq_last_6mths", "pub_rec", "revol_bal", "revol_util", "last_pymnt_amnt", "credit_age_yrs")
+
+coefficient <- c("5.544e-05", "6.048e-01", "1.151e-01", "-6.176e-06", "7.482e-01", "1.609e-01", "2.960e-01", "4.307e-06", "3.224e-01", "-1.713e-03", "-1.301e-02")
+
+LL <- c("4.831501e-05", "4.999118e-01", "1.003918e-01", "-7.498189e-06", "4.800723e-01", "1.369647e-01", "1.552171e-01", "2.122436e-06", "1.544932e-01", "-1.840821e-03", "-2.016724e-02")
+UL <- c("6.256867e-05", "7.097211e-01", "1.297239e-01", "-4.853604e-06", "1.016416e+00", "1.847847e-01", "4.367561e-01", "6.490544e-06", "4.903665e-01", "-1.586015e-03", "-5.855592e-03")
+
+
+
+plot <- data.frame(variable_name, coefficient, LL, UL)
+
+plot$coefficient <- as.numeric(plot$coefficient)
+plot$LL <- as.numeric(plot$LL)
+plot$UL <- as.numeric(plot$UL)
+```
+
+We generate a visualization illustrating the coefficients of each variable in terms of their effect on repay_fail and their corresponding confidence interval:
+
+```{r}
+p= ggplot(plot, aes(x=coefficient, y=variable_name)) + 
+  geom_point()+
+  geom_errorbar(aes(xmin = LL, xmax = UL))+
+  scale_y_discrete(limits = rev(c("loan_amnt", "term60 months", "int_rate", "annual_inc", "purposesmall_business", "inq_last_6mths", "pub_rec", "revol_bal", "revol_util", "last_pymnt_amnt", "credit_age_yrs")))+
+  ggtitle("GLMM Regression Results for significant coefficients")+
+  ylab("Variable")+
+  xlab("Coefficient")+
+  geom_vline(xintercept=0,lwd=0.5,colour="black")
+
+p
+```
+
+We now proceed to analyse the effect of each significant predictor on the dependent variable.
+
+With a positive effect we have:
+
+1.  loan_amnt and revol_bal: Although these variables have a positive coefficient it is very close to zero and has a very small confidence interval. Hence, we do not expect the loan amount and the total credit revolving balance to have a major effect on the ability of customers to repay their loans.
+2.  term_60 months: This variable has a large positive coefficient and a medium sized confidence interval compared to other predictors. However, even at the upper and lower bounds of the confidence interval the value of the coefficient remains quite large compared to other variables. Hence we expect that, compared to clients that pay in 36 months, those that pay in 60 will have a higher likelihood of failing to repay their loans.
+3.  int_rate: This variable has a positive coefficient with a small confidence interval. It is far from 0 enough to conclude that higher interest rates will increase the likelihood of repayment failure.
+4.  purposesmall_business: This variable has the largest positive coefficient but also a very large confidence interval. However, even at the lower bound of the confidence interval the coefficient value remains high. As a result, we can expect that when the purpose of the loan is to invest on a small business the likelihood of repayment failure by clients will increase compared to when the purpose of the loan is for a car.
+5.  inq_last_6mths: This variable has a positive coefficient with a small confidence interval. It is far from 0 enough to conclude that an increase in the number of inquiries in the past 6 months will increase the likelihood that clients will fail to repay their loans.
+6.  pub_rec: This variable has a positive coefficient with a medium sized confidence interval. However, at any point of such confidence interval the coefficient remains with quite a high value. Consequently, we expect that the higher the number of public derogatory records is, the higher the probability for loan applicants to default is.
+7.  revol_util: The significance of this variable is the main difference with the previous model. This variable has a positive coefficient with a medium sized confidence interval. Nevertheless, at any of it's bounds the coefficient is still quite high. Hence, the highest the revolving line utilization rate the higher the likelihood of borrower's default.
+
+With a negative effect we have:
+
+1.  annual_inc and last_pymnt_amnt: Although these variables have a negative coefficient it is very close to zero and has a very small confidence interval. Hence, we do not expect annual_income and the amount of the last payment made by clients to have a major effect on their ability to repay their loans.
+2.  credit_age_yrs: This variable has a negative coefficient close to zero but slightly more negative than the two others. However, the confidence interval is also slightly larger. Nevertheless, overall we do not expect the number of years since the borrower's earliest reported credit line to have a major effect on their ability to repay their loans.
+
+We analyse the random effects:
+
+1.  The variable location_nest has a variance of 0.04761. This is the largest variance of the random effects variables. Hence we can expect this variable to have the largest effect of all three.
+
+We can use the below function to extract the random effects:
+
+```{r}
+res <- ranef(GLMM_full_model_logit)
+plot(res$location_nest[,1])
+```
+
+We observe that overall there is no major relationship between the location of the borrower and the default probability of borrowers.
+
+2.  The variable earliestCreLine_nest has a variance of 0.01294. This is a small variance so we can expect this variable to have very limited effects on the dependent variable.
+
+We can use the below function to extract the random effects:
+
+```{r}
+res <- ranef(GLMM_full_model_logit)
+plot(res$earliestCreLine_nest[,1])
+```
+
+We observe that although the variance increases with the values of the x-axis the data points are still centered around 0. Therefore, there is no major relationship between the date of the earliest reported credit line of the borrower and the dependent variable.
+
+3.  The variable issue_date_nest has a variance of 0.01692. This is a small variance so we can expect this variable to have very limited effects on the dependent variable.
+
+We can use the below function to extract the random effects:
+
+```{r}
+res <- ranef(GLMM_full_model_logit)
+plot(res$issue_date_nest[,1])
+```
+
+We observe that overall there is no major relationship between the issue date of the loan and the dependent variable.
+
+## 3.4 Conclusions
+
+At this stage of the analysis we can address the last three key data analysis questions brought forward by the client:
+
+3- Fitting the GLMM shows that accounting for trends that may exist over time or between different jurisdictions does slightly increase the performance of the binomial model we fit in the first section in terms of true positive rates and Gini Score. Once more, such performance remains quite stable between training and testing set.
+
+4- The key difference between the two models is that the variable revol_util becomes significant and shows a strong positive relation with repayment failure. Intuitively, it makes sense that the larger the amount of credit the borrower is using relative to all available revolving credit will decrease their ability to repay. What is striking is that it still holds true for this model that predictors like loan amount or annual income do not seem to have strong effects in terms of credit risk prediction. Indeed, these have been widely considered traditionally.
+
+5- According to the results of this analysis credit risk does not change much over time or between states. Hence, the bank does not need to worry about particular locations or times of the year in order to obtain consistent revenues from loans.
+
+## References:
+
+-   Peterdy, K. (2022, August 30). 5 Cs of Credit. Corporate Finance Institute. <https://corporatefinanceinstitute.com/resources/knowledge/credit/5-cs-of-credit/>
